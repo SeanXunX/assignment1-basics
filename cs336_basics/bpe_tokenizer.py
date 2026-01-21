@@ -1,8 +1,12 @@
+import heapq
 import os
+from collections import defaultdict
 from multiprocessing import Pool
 from typing import BinaryIO
 
 import regex as re
+
+from cs336_basics.utils.max_heap import MaxHeapItem
 
 
 class BPETokenizer:
@@ -14,8 +18,11 @@ class BPETokenizer:
         self.PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         self.num_processes = num_processes
 
-        # vocabulary: mapping token id to bytes
-        self.vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+        # vocabulary: mapping token id to bytes. (id=i denotes the ith element)
+        self.vocab: list[bytes] = [bytes([i]) for i in range(256)]
+
+        # default vocabulary size
+        self.vocab_size: int = 256
 
         # merges: used in the merging stage. Merge <t1, t2> into one.
         self.merges: list[tuple[bytes, bytes]] = []
@@ -62,9 +69,9 @@ class BPETokenizer:
 
         return sorted(set(boundaries))
 
-    def _pre_tokenize_parallel(self):
+    def _pre_tokenize_parallel(self) -> tuple[list[list[bytes]], list[int]]:
         """
-        Pre tokenize in parallel. Get word frequencies stored at `self.bytes_freq`.
+        Pre tokenize in parallel. Get freq of bytes in words.
         """
         assert self.special_tokens is not None
         split_pattern_str = "|".join(self.special_tokens)
@@ -75,7 +82,7 @@ class BPETokenizer:
             boundaries = self._find_chunk_boundaries(f, self.num_processes, split_special_token)
 
             # if get fewer chunks
-            self.num_processes = len(boundaries)
+            self.num_processes = len(boundaries) - 1
 
         word_freq: dict[str, int] = {}
 
@@ -89,15 +96,108 @@ class BPETokenizer:
             for word, count in wf.items():
                 word_freq[word] = word_freq.get(word, 0) + count
 
-        self.bytes_freq: dict[tuple[bytes, ...], int] = {
-            tuple(bytes([b]) for b in word.encode("utf-8")): count for (word, count) in word_freq.items()
-        }
+        word_bytes: list[list[bytes]] = []
+        freqs: list[int] = []
 
-    def _merge(self):
+        for word, count in word_freq.items():
+            bytes_list = [bytes([b]) for b in word.encode("utf-8")]
+            word_bytes.append(bytes_list)
+            freqs.append(count)
+
+        return word_bytes, freqs
+
+    def _merge(self, word_bytes: list[list[bytes]], freqs: list[int]):
         """
         Merge adjacent bytes pair into one. Get `self.vocab` and `self.merges`.
         """
-        pass
+        # bytes_freq maintains the gloabal bytes pair frequency
+        pair_freq: dict[tuple[bytes, bytes], int] = {}
+
+        # indices pair postions (in which words)
+        pair_position: dict[tuple[bytes, bytes], set[int]] = defaultdict(set)
+
+        for i, (bs, f) in enumerate(zip(word_bytes, freqs)):
+            for p in zip(bs[:-1], bs[1:]):
+                pair_freq[p] = pair_freq.get(p, 0) + f
+                pair_position[p].add(i)
+
+        # max heap to get most frequent bytes pair.
+        # ! Use lazy deletion. Check the pair_freq to find if exist.
+        heap: list[MaxHeapItem] = []
+
+        for pair, freq in pair_freq.items():
+            heap.append(MaxHeapItem(bytes_pair=pair, freqency=freq))
+        heapq.heapify(heap)
+
+        while len(self.vocab) < self.vocab_size:
+            top = heapq.heappop(heap)
+            bp = top.bytes_pair
+
+            # Already merged
+            if bp not in pair_freq:
+                continue
+
+            # update self.merged and self.vocab
+            self.merges.append(bp)
+            new_bytes = bp[0] + bp[1]
+            self.vocab.append(new_bytes)
+
+            # new pairs to insert into heap
+            new_pairs: list[tuple[bytes, bytes]] = []
+
+            # search overlapped bytes in word_bytes and update
+            for pos in pair_position[bp]:
+                word_to_merge = word_bytes[pos]
+                word_len = len(word_to_merge)
+                word_freq = freqs[pos]
+
+                indices = [
+                    i
+                    for i, (a, b) in enumerate(zip(word_to_merge[:-1], word_to_merge[1:]))
+                    if a == bp[0] and b == bp[1]
+                ]
+
+                word_merged: list[bytes] = []
+                indices_pos = 0
+                i = 0
+
+                while i < word_len:
+                    if indices_pos < len(indices) and i == indices[indices_pos]:
+                        word_merged.append(new_bytes)
+
+                        # update pair_freq
+
+                        # rm cur pair by word_freq
+                        pair_freq[bp] -= word_freq
+                        if i - 1 >= 0:
+                            # prev
+                            prev_cur_pair = (word_to_merge[i - 1], new_bytes)
+                            if prev_cur_pair not in pair_freq:
+                                new_pairs.append(prev_cur_pair)
+                            pair_freq[prev_cur_pair] = pair_freq.get(prev_cur_pair, 0) + word_freq
+
+                        if i + 2 < word_len:
+                            # next
+                            cur_next_pair = (new_bytes, word_to_merge[i + 2])
+                            if cur_next_pair not in pair_freq:
+                                new_pairs.append(cur_next_pair)
+                            pair_freq[cur_next_pair] = pair_freq.get(cur_next_pair, 0) + word_freq
+
+                        indices_pos += 1
+                        i += 2
+                    else:
+                        word_merged.append(word_to_merge[i])
+                        i += 1
+
+                # update word_bytes to merged one
+                word_bytes[pos] = word_merged
+
+            # rm zero freq pairs in pair_freq
+            pair_freq = {k: v for k, v in pair_freq.items() if v != 0}
+
+            # insert into heap
+            for p in new_pairs:
+                heapq.heappush(heap, MaxHeapItem(freqency=pair_freq[p], bytes_pair=p))
 
     def train(
         self,
@@ -116,8 +216,17 @@ class BPETokenizer:
         self.vocab_size = vocab_size
         self.special_tokens = special_tokens
 
-        self._pre_tokenize_parallel()
-        self._merge()
+        # add special_tokens into vocab
+        for st in special_tokens:
+            self.vocab.append(st.encode("utf-8"))
+
+        if len(self.vocab) > self.vocab_size:
+            raise ValueError(
+                f"vocab size exceeded: length of self.vocab={len(self.vocab)} > self.vocab_size={self.vocab_size}"
+            )
+
+        word_freq_info = self._pre_tokenize_parallel()
+        self._merge(*word_freq_info)
 
 
 def pre_tokenize(args: tuple[str, int, int, str, str]) -> dict[str, int]:

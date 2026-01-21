@@ -3,6 +3,7 @@ import os
 from collections import defaultdict
 from multiprocessing import Pool
 from typing import BinaryIO
+from loguru import logger
 
 import regex as re
 
@@ -14,7 +15,7 @@ class BPETokenizer:
     Binary Pair Encoding tokenizer.
     """
 
-    def __init__(self, num_processes: int) -> None:
+    def __init__(self, num_processes: int = 4) -> None:
         self.PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         self.num_processes = num_processes
 
@@ -129,18 +130,25 @@ class BPETokenizer:
             heap.append(MaxHeapItem(bytes_pair=pair, freqency=freq))
         heapq.heapify(heap)
 
-        while len(self.vocab) < self.vocab_size:
+        while len(self.vocab) < self.vocab_size and len(heap) > 0:
             top = heapq.heappop(heap)
             bp = top.bytes_pair
 
-            # Already merged
-            if bp not in pair_freq:
+            # Already merged or old record
+            if bp not in pair_freq or top.freqency != pair_freq[bp]:
                 continue
+
+            # logger.debug(f"f={top.freqency}, bp={top.bytes_pair}")
 
             # update self.merged and self.vocab
             self.merges.append(bp)
             new_bytes = bp[0] + bp[1]
             self.vocab.append(new_bytes)
+
+            positions_to_check = list(pair_position.get(bp, set()))
+
+            for pos in positions_to_check:
+                word = word_bytes[pos]
 
             # new pairs to insert into heap
             new_pairs: list[tuple[bytes, bytes]] = []
@@ -175,6 +183,11 @@ class BPETokenizer:
                             if prev_cur_pair not in pair_freq:
                                 new_pairs.append(prev_cur_pair)
                             pair_freq[prev_cur_pair] = pair_freq.get(prev_cur_pair, 0) + word_freq
+                            pair_position[prev_cur_pair].add(pos)
+
+                            # decrease old pair freq
+                            old_prev_cur_pair = (word_to_merge[i - 1], bp[0])
+                            pair_freq[old_prev_cur_pair] -= word_freq
 
                         if i + 2 < word_len:
                             # next
@@ -182,6 +195,11 @@ class BPETokenizer:
                             if cur_next_pair not in pair_freq:
                                 new_pairs.append(cur_next_pair)
                             pair_freq[cur_next_pair] = pair_freq.get(cur_next_pair, 0) + word_freq
+                            pair_position[cur_next_pair].add(pos)
+
+                            # decrease old
+                            old_cur_next_pair = (bp[1], word_to_merge[i + 2])
+                            pair_freq[old_cur_next_pair] -= word_freq
 
                         indices_pos += 1
                         i += 2
@@ -201,7 +219,7 @@ class BPETokenizer:
 
     def train(
         self,
-        input_path: str,
+        input_path: str | os.PathLike,
         vocab_size: int,
         special_tokens: list[str],
     ):
@@ -212,13 +230,16 @@ class BPETokenizer:
         - vocab_size: int - A positive integer defines the maximum final vaocabulary size.
         - special_tokens: list[str] - A list of strings to add to the vocabluary.
         """
+        logger.info("Start training~")
         self.input_path = input_path
         self.vocab_size = vocab_size
         self.special_tokens = special_tokens
 
         # add special_tokens into vocab
+        special_vocab = []
         for st in special_tokens:
-            self.vocab.append(st.encode("utf-8"))
+            special_vocab.append(st.encode("utf-8"))
+        self.vocab = special_vocab + self.vocab
 
         if len(self.vocab) > self.vocab_size:
             raise ValueError(
@@ -229,7 +250,7 @@ class BPETokenizer:
         self._merge(*word_freq_info)
 
 
-def pre_tokenize(args: tuple[str, int, int, str, str]) -> dict[str, int]:
+def pre_tokenize(args: tuple[str | os.PathLike, int, int, str, str]) -> dict[str, int]:
     input_path, start, end, split_pattern_str, PAT = args
 
     pattern = re.compile(PAT)
@@ -246,3 +267,86 @@ def pre_tokenize(args: tuple[str, int, int, str, str]) -> dict[str, int]:
                 word_freq[word] = word_freq.get(word, 0) + 1
 
     return word_freq
+
+
+"""
+def _merge(self, word_bytes: list[list[bytes]], freqs: list[int]):
+    pair_freq: dict[tuple[bytes, bytes], int] = {}
+    pair_position: dict[tuple[bytes, bytes], set[int]] = defaultdict(set)
+
+    for i, (bs, f) in enumerate(zip(word_bytes, freqs)):
+        for p in zip(bs[:-1], bs[1:]):
+            pair_freq[p] = pair_freq.get(p, 0) + f
+            pair_position[p].add(i)
+
+    heap: list[MaxHeapItem] = []
+    for pair, freq in pair_freq.items():
+        heap.append(MaxHeapItem(bytes_pair=pair, freqency=freq))
+    heapq.heapify(heap)
+
+    while len(self.vocab) < self.vocab_size:
+        # 找到有效的最大频率 pair
+        while heap:
+            top = heapq.heappop(heap)
+            bp = top.bytes_pair
+            if bp in pair_freq and top.freqency == pair_freq[bp]:
+                break
+        else:
+            break  # heap 空了
+
+        self.merges.append(bp)
+        new_bytes = bp[0] + bp[1]
+        self.vocab.append(new_bytes)
+
+        # 复制一份，因为迭代时会修改
+        positions_to_check = list(pair_position.get(bp, set()))
+        
+        for pos in positions_to_check:
+            word = word_bytes[pos]
+            freq = freqs[pos]
+            
+            if len(word) < 2:
+                continue
+                
+            new_word: list[bytes] = []
+            i = 0
+            
+            while i < len(word):
+                # 检查是否可以合并
+                if i < len(word) - 1 and word[i] == bp[0] and word[i + 1] == bp[1]:
+                    # 更新左边 pair 的频率
+                    if new_word:
+                        old_left = (new_word[-1], bp[0])
+                        new_left = (new_word[-1], new_bytes)
+                        
+                        pair_freq[old_left] = pair_freq.get(old_left, 0) - freq
+                        pair_freq[new_left] = pair_freq.get(new_left, 0) + freq
+                        pair_position[new_left].add(pos)
+                        heapq.heappush(heap, MaxHeapItem(freqency=pair_freq[new_left], bytes_pair=new_left))
+                    
+                    # 更新右边 pair 的频率
+                    if i + 2 < len(word):
+                        old_right = (bp[1], word[i + 2])
+                        new_right = (new_bytes, word[i + 2])
+                        
+                        pair_freq[old_right] = pair_freq.get(old_right, 0) - freq
+                        pair_freq[new_right] = pair_freq.get(new_right, 0) + freq
+                        pair_position[new_right].add(pos)
+                        heapq.heappush(heap, MaxHeapItem(freqency=pair_freq[new_right], bytes_pair=new_right))
+                    
+                    # 减少当前 pair 频率
+                    pair_freq[bp] = pair_freq.get(bp, 0) - freq
+                    
+                    new_word.append(new_bytes)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            
+            word_bytes[pos] = new_word
+        
+        # 清理频率为 0 或负数的 pair
+        if bp in pair_freq and pair_freq[bp] <= 0:
+            del pair_freq[bp]
+
+"""

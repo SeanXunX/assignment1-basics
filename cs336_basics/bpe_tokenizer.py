@@ -14,7 +14,7 @@ class BPETokenizer:
     Binary Pair Encoding tokenizer.
     """
 
-    def __init__(self, num_processes: int) -> None:
+    def __init__(self, num_processes: int = 4) -> None:
         self.PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         self.num_processes = num_processes
 
@@ -91,8 +91,8 @@ class BPETokenizer:
             for start, end in zip(boundaries[:-1], boundaries[1:])
         ]
         with Pool(processes=self.num_processes) as p:
-            resutls = p.map(pre_tokenize, args)
-        for wf in resutls:
+            results = p.map(pre_tokenize, args)
+        for wf in results:
             for word, count in wf.items():
                 word_freq[word] = word_freq.get(word, 0) + count
 
@@ -126,15 +126,20 @@ class BPETokenizer:
         heap: list[MaxHeapItem] = []
 
         for pair, freq in pair_freq.items():
-            heap.append(MaxHeapItem(bytes_pair=pair, freqency=freq))
+            heap.append(MaxHeapItem(bytes_pair=pair, frequency=freq))
         heapq.heapify(heap)
 
-        while len(self.vocab) < self.vocab_size:
+        while len(self.vocab) < self.vocab_size and len(heap) > 0:
             top = heapq.heappop(heap)
             bp = top.bytes_pair
 
-            # Already merged
+            # Already merged, skip
             if bp not in pair_freq:
+                continue
+
+            # old record, update
+            if top.frequency != pair_freq[bp]:
+                heapq.heappush(heap, MaxHeapItem(bytes_pair=top.bytes_pair, frequency=pair_freq[bp]))
                 continue
 
             # update self.merged and self.vocab
@@ -142,66 +147,61 @@ class BPETokenizer:
             new_bytes = bp[0] + bp[1]
             self.vocab.append(new_bytes)
 
-            # new pairs to insert into heap
-            new_pairs: list[tuple[bytes, bytes]] = []
+            positions_to_check = list(pair_position.get(bp, set()))
 
-            # search overlapped bytes in word_bytes and update
-            for pos in pair_position[bp]:
-                word_to_merge = word_bytes[pos]
-                word_len = len(word_to_merge)
-                word_freq = freqs[pos]
+            for pos in positions_to_check:
+                word = word_bytes[pos]
+                freq = freqs[pos]
 
-                indices = [
-                    i
-                    for i, (a, b) in enumerate(zip(word_to_merge[:-1], word_to_merge[1:]))
-                    if a == bp[0] and b == bp[1]
-                ]
+                if len(word) < 2:
+                    continue
 
-                word_merged: list[bytes] = []
-                indices_pos = 0
+                new_word: list[bytes] = []
+
                 i = 0
+                while i < len(word):
+                    # check if bp found
+                    if i < len(word) - 1 and word[i] == bp[0] and word[i + 1] == bp[1]:
+                        # update self
+                        pair_freq[bp] = pair_freq.get(bp, 0) - freq
+                        pair_position[bp].discard(pos)
 
-                while i < word_len:
-                    if indices_pos < len(indices) and i == indices[indices_pos]:
-                        word_merged.append(new_bytes)
+                        # update left
+                        if new_word:
+                            old_left = (new_word[-1], bp[0])
+                            new_left = (new_word[-1], new_bytes)
 
-                        # update pair_freq
+                            pair_freq[old_left] = pair_freq.get(old_left, 0) - freq
+                            pair_freq[new_left] = pair_freq.get(new_left, 0) + freq
+                            pair_position[new_left].add(pos)
+                            heapq.heappush(heap, MaxHeapItem(bytes_pair=new_left, frequency=pair_freq[new_left]))
 
-                        # rm cur pair by word_freq
-                        pair_freq[bp] -= word_freq
-                        if i - 1 >= 0:
-                            # prev
-                            prev_cur_pair = (word_to_merge[i - 1], new_bytes)
-                            if prev_cur_pair not in pair_freq:
-                                new_pairs.append(prev_cur_pair)
-                            pair_freq[prev_cur_pair] = pair_freq.get(prev_cur_pair, 0) + word_freq
+                        # update right
+                        if i + 2 < len(word):
+                            old_right = (bp[1], word[i + 2])
+                            new_right = (new_bytes, word[i + 2])
 
-                        if i + 2 < word_len:
-                            # next
-                            cur_next_pair = (new_bytes, word_to_merge[i + 2])
-                            if cur_next_pair not in pair_freq:
-                                new_pairs.append(cur_next_pair)
-                            pair_freq[cur_next_pair] = pair_freq.get(cur_next_pair, 0) + word_freq
+                            pair_freq[old_right] = pair_freq.get(old_right, 0) - freq
+                            pair_freq[new_right] = pair_freq.get(new_right, 0) + freq
+                            pair_position[new_right].add(pos)
+                            heapq.heappush(heap, MaxHeapItem(bytes_pair=new_right, frequency=pair_freq[new_right]))
 
-                        indices_pos += 1
+                        new_word.append(new_bytes)
                         i += 2
                     else:
-                        word_merged.append(word_to_merge[i])
+                        new_word.append(word[i])
                         i += 1
 
-                # update word_bytes to merged one
-                word_bytes[pos] = word_merged
+                word_bytes[pos] = new_word
 
             # rm zero freq pairs in pair_freq
             pair_freq = {k: v for k, v in pair_freq.items() if v != 0}
 
-            # insert into heap
-            for p in new_pairs:
-                heapq.heappush(heap, MaxHeapItem(freqency=pair_freq[p], bytes_pair=p))
+            assert bp not in pair_freq
 
     def train(
         self,
-        input_path: str,
+        input_path: str | os.PathLike,
         vocab_size: int,
         special_tokens: list[str],
     ):
@@ -225,11 +225,14 @@ class BPETokenizer:
                 f"vocab size exceeded: length of self.vocab={len(self.vocab)} > self.vocab_size={self.vocab_size}"
             )
 
+        if len(special_tokens) == 0:
+            pass
+
         word_freq_info = self._pre_tokenize_parallel()
         self._merge(*word_freq_info)
 
 
-def pre_tokenize(args: tuple[str, int, int, str, str]) -> dict[str, int]:
+def pre_tokenize(args: tuple[str | os.PathLike, int, int, str, str]) -> dict[str, int]:
     input_path, start, end, split_pattern_str, PAT = args
 
     pattern = re.compile(PAT)

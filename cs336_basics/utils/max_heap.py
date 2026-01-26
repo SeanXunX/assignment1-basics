@@ -3,8 +3,10 @@ from dataclasses import dataclass
 
 @dataclass
 class MaxHeapItem:
-    freqency: int
+    frequency: int
     bytes_pair: tuple[bytes, bytes]
 
     def __lt__(self, other):
-        return self.freqency > other.freqency
+        if self.frequency != other.frequency:
+            return self.frequency > other.frequency
+        return self.bytes_pair > other.bytes_pair

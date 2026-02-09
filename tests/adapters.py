@@ -9,8 +9,8 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from cs336_basics import bpe_tokenizer
-from cs336_basics.bpe_tokenizer import BPETokenizer
+from cs336_basics import bpe_tokenizer_trainer
+from cs336_basics.bpe_tokenizer_trainer import BPETokenizerTrainer
 
 
 def run_linear(
@@ -592,7 +592,7 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    tokenizer = BPETokenizer()
+    tokenizer = BPETokenizerTrainer()
     tokenizer.train(input_path=input_path, vocab_size=vocab_size, special_tokens=special_tokens)
     vocab = {i: bs for i, bs in enumerate(tokenizer.vocab)}
     return vocab, tokenizer.merges

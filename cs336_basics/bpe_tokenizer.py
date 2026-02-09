@@ -1,251 +1,106 @@
-import heapq
-import os
-from collections import defaultdict
-from multiprocessing import Pool
-from typing import BinaryIO
-
+import json
+import math
 import regex as re
-
-from cs336_basics.utils.max_heap import MaxHeapItem
+from collections.abc import Iterable
 
 
 class BPETokenizer:
-    """
-    Binary Pair Encoding tokenizer.
-    """
+    def __init__(
+        self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None
+    ) -> None:
+        self.vocab: dict[int, bytes] = vocab
+        self.merges: list[tuple[bytes, bytes]] = merges
 
-    def __init__(self, num_processes: int = 4) -> None:
+        if special_tokens is None:
+            self.special_tokens = []
+        else:
+            self.special_tokens: list[str] = special_tokens
+
         self.PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        self.num_processes = num_processes
 
-        # vocabulary: mapping token id to bytes. (id=i denotes the ith element)
-        self.vocab: list[bytes] = [bytes([i]) for i in range(256)]
+        self._bytes_to_idx: dict[bytes, int] = {b: i for i, b in self.vocab.items()}
 
-        # default vocabulary size
-        self.vocab_size: int = 256
+    @classmethod
+    def from_files(
+        cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None
+    ) -> "BPETokenizer":
+        # load vocab
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            raw_vocab: dict[str, int] = json.load(f)
+        vocab: dict[int, bytes] = {idx: token.encode("utf-8") for token, idx in raw_vocab.items()}
 
-        # merges: used in the merging stage. Merge <t1, t2> into one.
-        self.merges: list[tuple[bytes, bytes]] = []
-
-    def _find_chunk_boundaries(
-        self,
-        file: BinaryIO,
-        desired_num_chunks: int,
-        split_special_token: bytes,
-    ) -> list[int]:
-        """
-        Chunk the file into parts that can be counted independently.
-        """
-        assert isinstance(split_special_token, bytes), "Must represetn special_tokens as a byte string"
-
-        # Get total file size in bytes
-        file.seek(0, os.SEEK_END)
-        file_size = file.tell()
-        file.seek(0)
-
-        chunk_size = file_size // desired_num_chunks
-
-        boundaries = [n * chunk_size for n in range(desired_num_chunks + 1)]
-        boundaries[-1] = file_size
-
-        read_size = 4096
-
-        for i in range(1, len(boundaries) - 1):
-            cur_pos = boundaries[i]
-            file.seek(cur_pos)
-            while True:
-                read_chunk = file.read(read_size)
-
-                # Already at the end of the file
-                if read_chunk == b"":
-                    boundaries[i] = file_size
-                    break
-
-                found_at = read_chunk.find(split_special_token)
-                if found_at != -1:
-                    boundaries[i] = cur_pos + found_at
-                    break
-                cur_pos += read_size
-
-        return sorted(set(boundaries))
-
-    def _pre_tokenize_parallel(self) -> tuple[list[list[bytes]], list[int]]:
-        """
-        Pre tokenize in parallel. Get freq of bytes in words.
-        """
-        assert self.special_tokens is not None
-        split_pattern_str = "|".join(self.special_tokens)
-
-        with open(self.input_path, "rb") as f:
-            # Assuming split token is the first of special tokens
-            split_special_token = self.special_tokens[0].encode("utf-8")
-            boundaries = self._find_chunk_boundaries(f, self.num_processes, split_special_token)
-
-            # if get fewer chunks
-            self.num_processes = len(boundaries) - 1
-
-        word_freq: dict[str, int] = {}
-
-        args = [
-            (self.input_path, start, end, split_pattern_str, self.PAT)
-            for start, end in zip(boundaries[:-1], boundaries[1:])
-        ]
-        with Pool(processes=self.num_processes) as p:
-            results = p.map(pre_tokenize, args)
-        for wf in results:
-            for word, count in wf.items():
-                word_freq[word] = word_freq.get(word, 0) + count
-
-        word_bytes: list[list[bytes]] = []
-        freqs: list[int] = []
-
-        for word, count in word_freq.items():
-            bytes_list = [bytes([b]) for b in word.encode("utf-8")]
-            word_bytes.append(bytes_list)
-            freqs.append(count)
-
-        return word_bytes, freqs
-
-    def _merge(self, word_bytes: list[list[bytes]], freqs: list[int]):
-        """
-        Merge adjacent bytes pair into one. Get `self.vocab` and `self.merges`.
-        """
-        # bytes_freq maintains the gloabal bytes pair frequency
-        pair_freq: dict[tuple[bytes, bytes], int] = {}
-
-        # indices pair postions (in which words)
-        pair_position: dict[tuple[bytes, bytes], set[int]] = defaultdict(set)
-
-        for i, (bs, f) in enumerate(zip(word_bytes, freqs)):
-            for p in zip(bs[:-1], bs[1:]):
-                pair_freq[p] = pair_freq.get(p, 0) + f
-                pair_position[p].add(i)
-
-        # max heap to get most frequent bytes pair.
-        # ! Use lazy deletion. Check the pair_freq to find if exist.
-        heap: list[MaxHeapItem] = []
-
-        for pair, freq in pair_freq.items():
-            heap.append(MaxHeapItem(bytes_pair=pair, frequency=freq))
-        heapq.heapify(heap)
-
-        while len(self.vocab) < self.vocab_size and len(heap) > 0:
-            top = heapq.heappop(heap)
-            bp = top.bytes_pair
-
-            # Already merged, skip
-            if bp not in pair_freq:
-                continue
-
-            # old record, update
-            if top.frequency != pair_freq[bp]:
-                heapq.heappush(heap, MaxHeapItem(bytes_pair=top.bytes_pair, frequency=pair_freq[bp]))
-                continue
-
-            # update self.merged and self.vocab
-            self.merges.append(bp)
-            new_bytes = bp[0] + bp[1]
-            self.vocab.append(new_bytes)
-
-            positions_to_check = list(pair_position.get(bp, set()))
-
-            for pos in positions_to_check:
-                word = word_bytes[pos]
-                freq = freqs[pos]
-
-                if len(word) < 2:
+        # load merges
+        merges: list[tuple[bytes, bytes]] = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
                     continue
+                a, b = line.split(" ")
+                merges.append((a.encode("utf-8"), b.encode("utf-8")))
 
-                new_word: list[bytes] = []
+        return cls(vocab, merges, special_tokens)
 
+    def _encode_one_word(self, word: str) -> list[int]:
+        byte_group = [bytes([b]) for b in word.encode("utf-8")]
+        merge_rank = {bp: i for i, bp in enumerate(self.merges)}
+        while True:
+            merge_bp: tuple[bytes, bytes] | None = None  # merge idx and idx + 1
+            rank: int = int(math.inf)
+            # find merge idx
+            for i, bp in enumerate(zip(byte_group[:-1], byte_group[1:])):
+                if bp in merge_rank and merge_rank.get(bp, math.inf) < rank:
+                    rank = merge_rank[bp]
+                    merge_bp = bp
+            if merge_bp is None:
+                # done
+                break
+            else:
+                # merge target bytes pair
+                new_byte_group = []
                 i = 0
-                while i < len(word):
-                    # check if bp found
-                    if i < len(word) - 1 and word[i] == bp[0] and word[i + 1] == bp[1]:
-                        # update self
-                        pair_freq[bp] = pair_freq.get(bp, 0) - freq
-                        pair_position[bp].discard(pos)
-
-                        # update left
-                        if new_word:
-                            old_left = (new_word[-1], bp[0])
-                            new_left = (new_word[-1], new_bytes)
-
-                            pair_freq[old_left] = pair_freq.get(old_left, 0) - freq
-                            pair_freq[new_left] = pair_freq.get(new_left, 0) + freq
-                            pair_position[new_left].add(pos)
-                            heapq.heappush(heap, MaxHeapItem(bytes_pair=new_left, frequency=pair_freq[new_left]))
-
-                        # update right
-                        if i + 2 < len(word):
-                            old_right = (bp[1], word[i + 2])
-                            new_right = (new_bytes, word[i + 2])
-
-                            pair_freq[old_right] = pair_freq.get(old_right, 0) - freq
-                            pair_freq[new_right] = pair_freq.get(new_right, 0) + freq
-                            pair_position[new_right].add(pos)
-                            heapq.heappush(heap, MaxHeapItem(bytes_pair=new_right, frequency=pair_freq[new_right]))
-
-                        new_word.append(new_bytes)
+                while i < len(byte_group):
+                    # 1. try match pair
+                    if i < len(byte_group) - 1 and merge_bp == (byte_group[i], byte_group[i + 1]):
+                        # 2. matched
+                        new_byte_group.append(merge_bp)
                         i += 2
                     else:
-                        new_word.append(word[i])
+                        # 3. failed
+                        new_byte_group.append(byte_group[i])
                         i += 1
+                byte_group = new_byte_group
+        return [self._bytes_to_idx[b] for b in byte_group]
 
-                word_bytes[pos] = new_word
-
-            # rm zero freq pairs in pair_freq
-            pair_freq = {k: v for k, v in pair_freq.items() if v != 0}
-
-            assert bp not in pair_freq
-
-    def train(
-        self,
-        input_path: str | os.PathLike,
-        vocab_size: int,
-        special_tokens: list[str],
-    ):
+    def encode(self, text: str) -> list[int]:
         """
-        Trains bpe tokenizer.
+        Encode input str.
+        In pretokenized words, iterate over all byte tuples and merge by the ranking order.
 
-        - input_path: str - Data to BPE tokenizer training data.
-        - vocab_size: int - A positive integer defines the maximum final vaocabulary size.
-        - special_tokens: list[str] - A list of strings to add to the vocabluary.
+        - text: str
         """
-        self.input_path = input_path
-        self.vocab_size = vocab_size
-        self.special_tokens = special_tokens
+        pattern = re.compile(self.PAT)
+        split_pattern = re.compile("|".join(self.special_tokens))
 
-        # add special_tokens into vocab
-        for st in special_tokens:
-            self.vocab.append(st.encode("utf-8"))
+        res: list[int] = []
 
-        if len(self.vocab) > self.vocab_size:
-            raise ValueError(
-                f"vocab size exceeded: length of self.vocab={len(self.vocab)} > self.vocab_size={self.vocab_size}"
-            )
-
-        if len(special_tokens) == 0:
-            pass
-
-        word_freq_info = self._pre_tokenize_parallel()
-        self._merge(*word_freq_info)
-
-
-def pre_tokenize(args: tuple[str | os.PathLike, int, int, str, str]) -> dict[str, int]:
-    input_path, start, end, split_pattern_str, PAT = args
-
-    pattern = re.compile(PAT)
-    split_pattern = re.compile(split_pattern_str)
-
-    word_freq: dict[str, int] = {}
-
-    with open(input_path, "rb") as f:
-        f.seek(start)
-        chunk = f.read(end - start).decode("utf-8")
-        for text in re.split(split_pattern, chunk):
+        for text in re.split(split_pattern, text):
             for match in re.finditer(pattern, text):
                 word = match.group()
-                word_freq[word] = word_freq.get(word, 0) + 1
+                encoded_word = self._encode_one_word(word)
+                res += encoded_word
+        return res
 
-    return word_freq
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
+        for text in iterable:
+            yield from self.encode(text)
+
+    def decode(self, ids: list[int]) -> str:
+        byte_group: list[bytes] = []
+        for id in ids:
+            token_bytes = self.vocab.get(id)
+            assert token_bytes is not None
+            byte_group.append(token_bytes)
+        all_bytes = b"".join(byte_group)
+        text = all_bytes.decode(encoding="utf-8", errors="replace")
+        return text

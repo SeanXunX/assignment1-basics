@@ -1,7 +1,8 @@
 import json
 import math
-import regex as re
 from collections.abc import Iterable
+
+import regex as re
 
 
 class BPETokenizer:
@@ -18,6 +19,7 @@ class BPETokenizer:
 
         self.PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
+        self._merge_rank = {bp: i for i, bp in enumerate(self.merges)}
         self._bytes_to_idx: dict[bytes, int] = {b: i for i, b in self.vocab.items()}
 
     @classmethod
@@ -25,13 +27,13 @@ class BPETokenizer:
         cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None
     ) -> "BPETokenizer":
         # load vocab
-        with open(vocab_filepath, "r", encoding="utf-8") as f:
+        with open(vocab_filepath, encoding="utf-8") as f:
             raw_vocab: dict[str, int] = json.load(f)
         vocab: dict[int, bytes] = {idx: token.encode("utf-8") for token, idx in raw_vocab.items()}
 
-        # load merges
+        # load merges - decode GPT-2's unicode representation back to bytes
         merges: list[tuple[bytes, bytes]] = []
-        with open(merges_filepath, "r", encoding="utf-8") as f:
+        with open(merges_filepath, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -43,14 +45,13 @@ class BPETokenizer:
 
     def _encode_one_word(self, word: str) -> list[int]:
         byte_group = [bytes([b]) for b in word.encode("utf-8")]
-        merge_rank = {bp: i for i, bp in enumerate(self.merges)}
         while True:
             merge_bp: tuple[bytes, bytes] | None = None  # merge idx and idx + 1
-            rank: int = int(math.inf)
+            rank = math.inf
             # find merge idx
             for i, bp in enumerate(zip(byte_group[:-1], byte_group[1:])):
-                if bp in merge_rank and merge_rank.get(bp, math.inf) < rank:
-                    rank = merge_rank[bp]
+                if bp in self._merge_rank and self._merge_rank.get(bp, math.inf) < rank:
+                    rank = self._merge_rank[bp]
                     merge_bp = bp
             if merge_bp is None:
                 # done
@@ -63,7 +64,7 @@ class BPETokenizer:
                     # 1. try match pair
                     if i < len(byte_group) - 1 and merge_bp == (byte_group[i], byte_group[i + 1]):
                         # 2. matched
-                        new_byte_group.append(merge_bp)
+                        new_byte_group.append(merge_bp[0] + merge_bp[1])
                         i += 2
                     else:
                         # 3. failed
@@ -80,15 +81,28 @@ class BPETokenizer:
         - text: str
         """
         pattern = re.compile(self.PAT)
-        split_pattern = re.compile("|".join(self.special_tokens))
 
         res: list[int] = []
 
-        for text in re.split(split_pattern, text):
-            for match in re.finditer(pattern, text):
-                word = match.group()
-                encoded_word = self._encode_one_word(word)
-                res += encoded_word
+        # Handle special tokens splitting only if there are special tokens
+        if self.special_tokens:
+            sorted_special_tokens = sorted(self.special_tokens, key=len, reverse=True)
+            escaped_special_tokens = [re.escape(t) for t in sorted_special_tokens]
+            split_pattern = re.compile("(" + "|".join(escaped_special_tokens) + ")")
+            parts = re.split(split_pattern, text)
+        else:
+            parts = [text]
+
+        for part in parts:
+            if not part:
+                continue
+            if part in self.special_tokens:
+                res.append(self._bytes_to_idx[part.encode("utf-8")])
+            else:
+                for match in re.finditer(pattern, part):
+                    word = match.group()
+                    encoded_word = self._encode_one_word(word)
+                    res += encoded_word
         return res
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:

@@ -1,0 +1,5 @@
+num_process: 16
+dataset: "~/Code/cs336-25spring/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt"
+vocab_size: 10_000
+special_tokens:
+  - "<|endoftext|>"
